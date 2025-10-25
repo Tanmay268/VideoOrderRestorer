@@ -1,26 +1,25 @@
 import cv2
+import numpy as np
 import os
+import sys
 
-frames_folder = "D:/Downloads/Tecdia/reconstructed_frames"
-output_video = "D:/Downloads/Tecdia/reconstructed_video.mp4"
-fps = 30
+def create_video(frames_folder, order_file, output_file, fps=30):
+    order = np.loadtxt(order_file, dtype=int)
+    files = sorted(os.listdir(frames_folder))
+    frame_example = cv2.imread(os.path.join(frames_folder, files[0]))
+    h, w, _ = frame_example.shape
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    video_writer = cv2.VideoWriter(output_file, fourcc, fps, (w, h))
 
-frame_files = sorted(os.listdir(frames_folder))
-frame_paths = [os.path.join(frames_folder, f) for f in frame_files]
-
-frame = cv2.imread(frame_paths[0])
-height, width, layers = frame.shape
-
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-video_writer = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
-
-for idx, frame_path in enumerate(frame_paths):
-    frame = cv2.imread(frame_path)
-    if frame is not None:
+    for idx in order:
+        frame = cv2.imread(os.path.join(frames_folder, files[idx]))
         video_writer.write(frame)
-        print(f"Added frame: {frame_path}")
-    else:
-        print(f"Failed to read: {frame_path}")
 
-video_writer.release()
-print("Finished writing video:", output_video)
+    video_writer.release()
+    print(f"Reconstructed video saved to {output_file}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 4:
+        print("Usage: python convertToVideo.py frames_folder order_file output_video.mp4")
+        sys.exit(1)
+    create_video(sys.argv[1], sys.argv[2], sys.argv[3])
