@@ -103,12 +103,6 @@ pip install opencv-python numpy scikit-image torch torchvision scipy
 
 ---
 
-## License
-
-Specify your license here.
-
----
-
 ## Contact
 
 For questions or contributions, please contact - kaushiktanmay332@gmail.com.
