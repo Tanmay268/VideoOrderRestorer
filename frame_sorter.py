@@ -1,9 +1,11 @@
 import cv2
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
-import time
-import os
+import torch
+from torchvision import models, transforms
+from scipy.spatial.distance import cdist
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import os, time
 
 
 class VideoFrameSorter:
@@ -11,118 +13,199 @@ class VideoFrameSorter:
         self.input_video = input_video_path
         self.output_video = output_video_path
         self.frames = []
-        self.frames_small = []  # Downsampled frames for faster processing
+        self.frames_small = []
+        self.features = []
         self.frame_count = 0
         self.fps = 30
         self.frame_size = None
+
+        # Hybrid weights sum roughly to 1.0
+        self.W_SSIM = 0.25
+        self.W_HIST = 0.15
+        self.W_CNN = 0.40
+        self.W_EDGE = 0.10
+        self.W_FLOW = 0.10
+
+        # Setup MobileNetV2 on CPU
+        cnn = models.mobilenet_v2(pretrained=True)
+        self.feat_extractor = torch.nn.Sequential(*list(cnn.children())[:-1])
+        self.feat_extractor.eval()
+        self.preprocess = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+        ])
 
     def extract_frames(self):
         print("Extracting frames from video...")
         cap = cv2.VideoCapture(self.input_video)
         if not cap.isOpened():
             raise ValueError(f"Could not open video file: {self.input_video}")
-
         self.fps = int(cap.get(cv2.CAP_PROP_FPS))
-        self.frame_size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                           int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                           )
+        self.frame_size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
             self.frames.append(frame)
-            frame_small = cv2.resize(frame, (320, 180))
-            self.frames_small.append(frame_small)
+            self.frames_small.append(cv2.resize(frame, (320,180)))
         cap.release()
         self.frame_count = len(self.frames)
-        print(f"Frames extracted: {self.frame_count} (FPS: {self.fps}, Frame size: {self.frame_size})")
-        print("Processing at reduced resolution for speed.")
+        print(f"Frames extracted: {self.frame_count}")
 
-    def compute_frame_similarity_fast(self, idx1, idx2):
-        f1 = self.frames_small[idx1]
-        f2 = self.frames_small[idx2]
+    def compute_cnn_features(self):
+        print("Extracting CNN features (MobileNetV2, CPU)...")
+        features = []
+        with torch.no_grad():
+            for idx, frame in enumerate(self.frames):
+                img = cv2.cvtColor(cv2.resize(frame, (224,224)), cv2.COLOR_BGR2RGB)
+                input_tensor = self.preprocess(img)
+                input_tensor = input_tensor.unsqueeze(0)
+                feat = self.feat_extractor(input_tensor).flatten().numpy()
+                features.append(feat)
+                if (idx+1) % 25 == 0:
+                    print(f"Extracted features: {idx+1}/{self.frame_count}")
+        self.features = np.array(features)
+        print("CNN feature extraction complete.")
+
+    def edge_histogram(self, img):
+        edges = cv2.Canny(img, 50, 150)
+        hist = cv2.calcHist([edges], [0], None, [16], [0,256])
+        hist = cv2.normalize(hist, hist).flatten()
+        return hist
+
+    def optical_flow_similarity(self, f1, f2):
         gray1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY)
         gray2 = cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY)
-        ssim_score = ssim(gray1, gray2)
-        hist1 = cv2.calcHist([f1], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
-        hist2 = cv2.calcHist([f2], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
-        hist1 = cv2.normalize(hist1, hist1).flatten()
-        hist2 = cv2.normalize(hist2, hist2).flatten()
-        hist_score = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
-        combined_score = (0.7 * ssim_score + 0.3 * hist_score)
-        return combined_score
+        flow = cv2.calcOpticalFlowFarneback(gray1, gray2, None,
+                                            pyr_scale=0.5, levels=3, winsize=15,
+                                            iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
+        mag, _ = cv2.cartToPolar(flow[...,0], flow[...,1])
+        mean_mag = np.mean(mag)
+        return -mean_mag  # Negative mean magnitude as similarity (small motion diff is better)
 
-    def build_similarity_matrix_parallel(self):
-        print("Building similarity matrix (parallel processing)...")
+    def compute_hybrid_similarity(self):
+        print("Computing hybrid similarity matrix (parallel)...")
         n = self.frame_count
-        similarity_matrix = np.zeros((n, n))
-        comparisons = [(i, j) for i in range(n) for j in range(i + 1, n)]
-        print(f"Similarity comparisons to compute: {len(comparisons)}")
-        max_workers = min(8, os.cpu_count() or 4)
-        print(f"Using {max_workers} threads.")
-        count = 0
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_pair = {
-                executor.submit(self.compute_frame_similarity_fast, i, j): (i, j)
-                for i, j in comparisons
-            }
-            for future in as_completed(future_to_pair):
-                i, j = future_to_pair[future]
-                similarity = future.result()
-                similarity_matrix[i][j] = similarity
-                similarity_matrix[j][i] = similarity
-                count += 1
+        ssim_arr = np.zeros((n,n))
+        hist_arr = np.zeros((n,n))
+        edge_arr = np.zeros((n,n))
+        flow_arr = np.zeros((n,n))
+        comparisons = [(i,j) for i in range(n) for j in range(i+1, n)]
+
+        def worker(i,j):
+            f1, f2 = self.frames_small[i], self.frames_small[j]
+            gray1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY)
+            gray2 = cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY)
+            ssim_score = ssim(gray1, gray2)
+            h1 = cv2.calcHist([f1], [0,1,2], None, [8,8,8], [0,256,0,256,0,256])
+            h2 = cv2.calcHist([f2], [0,1,2], None, [8,8,8], [0,256,0,256,0,256])
+            h1 = cv2.normalize(h1, h1).flatten()
+            h2 = cv2.normalize(h2, h2).flatten()
+            hist_score = cv2.compareHist(h1,h2,cv2.HISTCMP_CORREL)
+            e1 = self.edge_histogram(f1)
+            e2 = self.edge_histogram(f2)
+            edge_score = cv2.compareHist(e1,e2,cv2.HISTCMP_CORREL)
+            flow_score = self.optical_flow_similarity(f1,f2)
+            return (i,j,ssim_score,hist_score,edge_score, flow_score)
+
+        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as executor:
+            futures = [executor.submit(worker,i,j) for i,j in comparisons]
+            for count, f in enumerate(as_completed(futures), 1):
+                i,j, ssim_score,hist_score,edge_score,flow_score = f.result()
+                ssim_arr[i,j] = ssim_arr[j,i] = ssim_score
+                hist_arr[i,j] = hist_arr[j,i] = hist_score
+                edge_arr[i,j] = edge_arr[j,i] = edge_score
+                flow_arr[i,j] = flow_arr[j,i] = flow_score
                 if count % 1000 == 0:
-                    print(f"Computed {count} / {len(comparisons)} similarities")
-        print("Similarity matrix construction complete.")
-        return similarity_matrix
+                    print(f"Hybrid features done: {count}/{len(comparisons)}")
 
-    def find_optimal_sequence_greedy(self, similarity_matrix):
-        print("Finding optimal frame sequence using greedy algorithm.")
+        print("Image features done; computing CNN similarity...")
+        sim_feat_matrix = 1 - cdist(self.features, self.features, metric='cosine')
+        sim_matrix = (self.W_SSIM*ssim_arr
+                      + self.W_HIST*hist_arr
+                      + self.W_CNN*sim_feat_matrix
+                      + self.W_EDGE*edge_arr
+                      + self.W_FLOW*flow_arr )
+        return sim_matrix
+
+    def find_sequence_greedy_multi_start(self, similarity_matrix, n_starts=5):
+        print(f"Running greedy multi-start assembly ({n_starts} starts)...")
         n = self.frame_count
-        visited = set()
-        sequence = []
-        avg_similarities = np.mean(similarity_matrix, axis=1)
-        current = np.argmax(avg_similarities)
-        sequence.append(current)
-        visited.add(current)
-        count = 0
-        while len(visited) < n:
-            unvisited = [i for i in range(n) if i not in visited]
-            similarities = similarity_matrix[current][unvisited]
-            best_idx = np.argmax(similarities)
-            best_next = unvisited[best_idx]
-            sequence.append(best_next)
-            visited.add(best_next)
-            current = best_next
-            count += 1
-            if count % 50 == 0:
-                print(f"Sequence building progress: {count} / {n - 1}")
-        print("Frame sequence determined.")
-        return sequence
+        avg_sim = np.mean(similarity_matrix, axis=1)
+        seeds = np.argsort(-avg_sim)[:n_starts]
+        best_score = -np.inf
+        best_sequence = None
 
-    def refine_sequence_fast(self, sequence, similarity_matrix):
-        print("Refining sequence. Determining best starting frame...")
+        for seed in seeds:
+            visited = set([seed])
+            sequence = [seed]
+            current = seed
+            while len(visited) < n:
+                unvisited = [i for i in range(n) if i not in visited]
+                sims = similarity_matrix[current][unvisited]
+                next_frame = unvisited[np.argmax(sims)]
+                sequence.append(next_frame)
+                visited.add(next_frame)
+                current = next_frame
+            score = sum(similarity_matrix[sequence[i]][sequence[i+1]] for i in range(n-1))
+            print(f"Seed {seed} score: {score:.4f}")
+            if score > best_score:
+                best_score = score
+                best_sequence = sequence
+        print("Best sequence selected from multi-start.")
+        return best_sequence
+
+    def choose_best_direction(self, sequence, similarity_matrix):
+        score_fwd = sum(similarity_matrix[sequence[i]][sequence[i+1]] for i in range(len(sequence)-1))
+        rev_seq = sequence[::-1]
+        score_rev = sum(similarity_matrix[rev_seq[i]][rev_seq[i+1]] for i in range(len(rev_seq)-1))
+        if score_rev > score_fwd:
+            print("Using reversed sequence for better total similarity.")
+            return rev_seq
+        else:
+            return sequence
+
+    def two_opt(self, sequence, similarity_matrix, max_iter=15):
+        print(f"Performing 2-opt local search (max_iter={max_iter})...")
         n = len(sequence)
-        sample_positions = range(0, n, max(1, n // 30))
-        best_start = 0
-        best_score = 0
+        best = sequence[:]
+        improved = True
         count = 0
-        for start_idx in sample_positions:
-            total_similarity = 0
-            for i in range(min(n - 1, 50)):
-                curr_frame = sequence[(start_idx + i) % n]
-                next_frame = sequence[(start_idx + i + 1) % n]
-                total_similarity += similarity_matrix[curr_frame][next_frame]
-            if total_similarity > best_score:
-                best_score = total_similarity
-                best_start = start_idx
+
+        def path_score(seq):
+            return sum(similarity_matrix[seq[i]][seq[i+1]] for i in range(len(seq)-1))
+
+        best_score = path_score(best)
+        while improved and count < max_iter:
+            improved = False
+            for i in range(1, n - 2):
+                for j in range(i + 1, n):
+                    if j - i == 1:
+                        continue
+                    new_seq = best[:i] + best[i:j][::-1] + best[j:]
+                    new_score = path_score(new_seq)
+                    if new_score > best_score:
+                        best = new_seq
+                        best_score = new_score
+                        improved = True
+                        print(f"2-opt improvement iteration {count+1} flipping {i}-{j}")
             count += 1
-            if count % 5 == 0:
-                print(f"Refinement progress: {count} / {len(sample_positions)} candidate starts tested")
-        refined_sequence = sequence[best_start:] + sequence[:best_start]
-        print("Sequence refinement complete.")
-        return refined_sequence
+        print("2-opt search complete.")
+        return best
+
+    def windowed_two_opt(self, sequence, similarity_matrix, window=30, n_passes=2):
+        print(f"Starting windowed 2-opt: window={window}, passes={n_passes}...")
+        n = len(sequence)
+        best = sequence[:]
+        for _ in range(n_passes):
+            for start in range(0, n - window + 1, window // 2):
+                wseq = best[start:start+window]
+                improved_seq = self.two_opt(wseq, similarity_matrix, max_iter=3)
+                best[start:start+window] = improved_seq
+        print("Windowed 2-opt complete.")
+        return best
 
     def write_output_video(self, sequence):
         print("Writing output video...")
@@ -130,85 +213,71 @@ class VideoFrameSorter:
         out = cv2.VideoWriter(self.output_video, fourcc, self.fps, self.frame_size)
         for idx, frame_idx in enumerate(sequence):
             out.write(self.frames[frame_idx])
-            if (idx + 1) % 50 == 0:
-                print(f"Wrote {idx + 1} / {len(sequence)} frames to output.")
+            if (idx+1) % 50 == 0:
+                print(f"Wrote {idx+1} / {len(sequence)} frames")
         out.release()
-        print(f"Output video saved to: {self.output_video}")
+        
 
     def calculate_accuracy(self, sequence):
-        correct_positions = 0
-        for position, frame_idx in enumerate(sequence):
-            if position == frame_idx:
-                correct_positions += 1
-        accuracy = (correct_positions / len(sequence)) * 100
-        return accuracy
+        correct_positions = sum(1 for i,val in enumerate(sequence) if i == val)
+        return (correct_positions / len(sequence)) * 100
 
     def neighbor_consistency(self, sequence):
-        correct_pairs = 0
-        for i in range(len(sequence) - 1):
-            if sequence[i] + 1 == sequence[i + 1]:
-                correct_pairs += 1
-        return (correct_pairs / (len(sequence) - 1)) * 100
+        correct_pairs = sum(1 for i in range(len(sequence)-1) if sequence[i]+1 == sequence[i+1])
+        return (correct_pairs / (len(sequence)-1)) * 100
 
     def reconstruct(self):
-        start_time = time.time()
+        total_start = time.time()
         self.extract_frames()
-        similarity_matrix = self.build_similarity_matrix_parallel()
-        sequence = self.find_optimal_sequence_greedy(similarity_matrix)
-        refined_sequence = self.refine_sequence_fast(sequence, similarity_matrix)
-        self.write_output_video(refined_sequence)
-        accuracy = self.calculate_accuracy(refined_sequence)
-        neighbor_acc = self.neighbor_consistency(refined_sequence)
-        end_time = time.time()
-        execution_time = end_time - start_time
-        print("-" * 60)
-        print("Reconstruction completed.")
-        print(f"Total execution time: {execution_time:.2f} seconds ({execution_time / 60:.2f} minutes)")
-        print(f"Frame order accuracy (exact position): {accuracy:.2f}%")
+        self.compute_cnn_features()
+        sim_matrix = self.compute_hybrid_similarity()
+        init_seq = self.find_sequence_greedy_multi_start(sim_matrix)
+        init_seq = self.choose_best_direction(init_seq, sim_matrix)
+        refined_seq = self.two_opt(init_seq, sim_matrix, max_iter=15)
+        windowed_seq = self.windowed_two_opt(refined_seq, sim_matrix, window=30, n_passes=2)
+        self.write_output_video(windowed_seq)
+        accuracy = self.calculate_accuracy(windowed_seq)
+        neighbor_acc = self.neighbor_consistency(windowed_seq)
+        elapsed = time.time() - total_start
+        print("-"*60)
+        print("Reconstruction complete.")
+        print(f"Execution time: {elapsed:.2f}s ({elapsed/60:.2f} min)")
+        print(f"Exact position accuracy: {accuracy:.2f}%")
         print(f"Neighbor pair accuracy: {neighbor_acc:.2f}%")
-        print("-" * 60)
-        return execution_time, accuracy, neighbor_acc
+        print("-"*60)
+        return elapsed, accuracy, neighbor_acc
 
 
 def main():
-    INPUT_VIDEO = "jumbled_video.mp4"
-    OUTPUT_VIDEO = "reconstructed_video.mp4"
-    print("=" * 60)
-    print("VIDEO FRAME RECONSTRUCTION (Student Version)")
-    print("=" * 60)
-    if not os.path.exists(INPUT_VIDEO):
-        print(f"Error: Input video '{INPUT_VIDEO}' not found!")
-        print(f"Current directory: {os.getcwd()}")
+    input_video = "jumbled_video.mp4"
+    output_video = "reconstructed_video.mp4"
+    print("="*60)
+    print("VIDEO FRAME RECONSTRUCTION: Optical Flow + Hybrid Similarity + Multi-Greedy + 2-opt")
+    print("="*60)
+    if not os.path.exists(input_video):
+        print(f"Input video '{input_video}' not found in {os.getcwd()}")
         return
-    print(f"Found input video: {INPUT_VIDEO}")
-    print(f"File size: {os.path.getsize(INPUT_VIDEO) / (1024 * 1024):.2f} MB")
-    try:
-        sorter = VideoFrameSorter(INPUT_VIDEO, OUTPUT_VIDEO)
-        execution_time, accuracy, neighbor_acc = sorter.reconstruct()
-        with open("execution_time.log", "w") as f:
-            f.write("Video Frame Reconstruction (Student Version)\n")
-            f.write("=" * 50 + "\n")
-            f.write(f"Input: {INPUT_VIDEO}\n")
-            f.write(f"Output: {OUTPUT_VIDEO}\n")
-            f.write(f"Total frames: {sorter.frame_count}\n")
-            f.write(f"FPS: {sorter.fps}\n")
-            f.write(f"Resolution: {sorter.frame_size}\n")
-            f.write(f"Execution time: {execution_time:.2f} seconds\n")
-            f.write(f"Execution time: {execution_time / 60:.2f} minutes\n")
-            f.write(f"Frame order accuracy (exact position): {accuracy:.2f}%\n")
-            f.write(f"Neighbor pair accuracy: {neighbor_acc:.2f}%\n")
-            f.write("\nOptimizations applied:\n")
-            f.write("- Parallel processing (multi-threading)\n")
-            f.write("- Downsampled frames (320x180)\n")
-            f.write("- Fast greedy algorithm\n")
-            f.write("- Sampled refinement\n")
-        print("Execution time and accuracy logged to: execution_time.log")
-    except Exception as e:
-        print("\nError occurred during reconstruction:")
-        print(f"{type(e).__name__}: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    sorter = VideoFrameSorter(input_video, output_video)
+    exec_time, pos_acc, neigh_acc = sorter.reconstruct()
+    print(type(output_video))
+    print(output_video)
+    print(input_video)
+    print(type(input_video))
+    with open("execution_time.log", "w") as f:
+        f.write("Video Frame Reconstruction Log\n")
+        f.write("="*50+"\n")
+        f.write(f"Input: {input_video}\n")
+        f.write(f"Output: {output_video}\n")
 
+        f.write(f"Total frames: {sorter.frame_count}\n")
+        f.write(f"FPS: {sorter.fps}\n")
+        f.write(f"Resolution: {sorter.frame_size}\n")
+        f.write(f"Execution time: {exec_time:.2f} seconds\n")
+        f.write(f"Exact position accuracy: {pos_acc:.2f}%\n")
+        f.write(f"Neighbor pair accuracy: {neigh_acc:.2f}%\n")
+        f.write(f"this is the input video \n{input_video}\n")
+        f.write(f"this is the output video \n{output_video}\n")
+    print("Execution time and accuracy logged to execution_time.log")
 
 if __name__ == "__main__":
     main()
