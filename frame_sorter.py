@@ -217,14 +217,6 @@ class VideoFrameSorter:
                 print(f"Wrote {idx+1} / {len(sequence)} frames")
         out.release()
 
-    def calculate_accuracy(self, sequence):
-        correct_positions = sum(1 for i,val in enumerate(sequence) if i == val)
-        return (correct_positions / len(sequence)) * 100
-
-    def neighbor_consistency(self, sequence):
-        correct_pairs = sum(1 for i in range(len(sequence)-1) if sequence[i]+1 == sequence[i+1])
-        return (correct_pairs / (len(sequence)-1)) * 100
-
     def calculate_smoothness(self, sequence, similarity_matrix):
         consecutive_similarities = [similarity_matrix[sequence[i], sequence[i+1]] for i in range(len(sequence)-1)]
         smoothness_score = np.mean(consecutive_similarities) * 100  # scale to %
@@ -266,8 +258,6 @@ class VideoFrameSorter:
         refined_seq = self.two_opt(init_seq, sim_matrix, max_iter=15)
         windowed_seq = self.windowed_two_opt(refined_seq, sim_matrix, window=30, n_passes=2)
         self.write_output_video(windowed_seq)
-        accuracy = self.calculate_accuracy(windowed_seq)
-        neighbor_acc = self.neighbor_consistency(windowed_seq)
         smoothness = self.calculate_smoothness(windowed_seq, sim_matrix)
 
         reordered_frames = [self.frames[i] for i in windowed_seq]
@@ -278,13 +268,11 @@ class VideoFrameSorter:
         print("-"*60)
         print("Reconstruction complete.")
         print(f"Execution time: {elapsed:.2f}s ({elapsed/60:.2f} min)")
-        print(f"Exact position accuracy: {accuracy:.2f}%")
-        print(f"Neighbor pair accuracy: {neighbor_acc:.2f}%")
         print(f"Sequence smoothness score: {smoothness:.2f}%")
         print(f"Temporal SSIM score: {temporal_ssim_score:.2f}%")
         print(f"Optical Flow Consistency score: {flow_consistency_score:.2f}%")
         print("-"*60)
-        return elapsed, accuracy, neighbor_acc, smoothness, temporal_ssim_score, flow_consistency_score
+        return elapsed, smoothness, temporal_ssim_score, flow_consistency_score
 
 
 def main():
@@ -297,8 +285,7 @@ def main():
         print(f"Input video '{input_video}' not found in {os.getcwd()}")
         return
     sorter = VideoFrameSorter(input_video, output_video)
-    results = sorter.reconstruct()
-    exec_time, pos_acc, neigh_acc, smooth_acc, temporal_ssim_score, flow_consistency_score = results
+    exec_time, smooth_acc, temporal_ssim_score, flow_consistency_score = sorter.reconstruct()
     with open("execution_time.log", "w") as f:
         f.write("Video Frame Reconstruction Log\n")
         f.write("="*50+"\n")
@@ -308,8 +295,6 @@ def main():
         f.write(f"FPS: {sorter.fps}\n")
         f.write(f"Resolution: {sorter.frame_size}\n")
         f.write(f"Execution time: {exec_time:.2f} seconds\n")
-        f.write(f"Exact position accuracy: {pos_acc:.2f}%\n")
-        f.write(f"Neighbor pair accuracy: {neigh_acc:.2f}%\n")
         f.write(f"Sequence smoothness score: {smooth_acc:.2f}%\n")
         f.write(f"Temporal SSIM score: {temporal_ssim_score:.2f}%\n")
         f.write(f"Optical Flow Consistency score: {flow_consistency_score:.2f}%\n")
