@@ -216,7 +216,6 @@ class VideoFrameSorter:
             if (idx+1) % 50 == 0:
                 print(f"Wrote {idx+1} / {len(sequence)} frames")
         out.release()
-        
 
     def calculate_accuracy(self, sequence):
         correct_positions = sum(1 for i,val in enumerate(sequence) if i == val)
@@ -225,6 +224,37 @@ class VideoFrameSorter:
     def neighbor_consistency(self, sequence):
         correct_pairs = sum(1 for i in range(len(sequence)-1) if sequence[i]+1 == sequence[i+1])
         return (correct_pairs / (len(sequence)-1)) * 100
+
+    def calculate_smoothness(self, sequence, similarity_matrix):
+        consecutive_similarities = [similarity_matrix[sequence[i], sequence[i+1]] for i in range(len(sequence)-1)]
+        smoothness_score = np.mean(consecutive_similarities) * 100  # scale to %
+        return smoothness_score
+
+    def temporal_ssim(self, frames):
+        n = len(frames)
+        temporal_ssim_scores = []
+        for i in range(n-1):
+            gray1 = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
+            gray2 = cv2.cvtColor(frames[i+1], cv2.COLOR_BGR2GRAY)
+            score, _ = ssim(gray1, gray2, full=True)
+            temporal_ssim_scores.append(score)
+        avg_temporal_ssim = np.mean(temporal_ssim_scores) * 100  # scaled %
+        return avg_temporal_ssim
+
+    def refined_optical_flow_consistency(self, frames):
+        angles = []
+        for i in range(len(frames)-1):
+            gray1 = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
+            gray2 = cv2.cvtColor(frames[i+1], cv2.COLOR_BGR2GRAY)
+            flow = cv2.calcOpticalFlowFarneback(gray1, gray2, None,
+                                                pyr_scale=0.5, levels=3, winsize=15,
+                                                iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
+            mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
+            angles.append(ang.flatten())
+        all_angles = np.concatenate(angles)
+        angle_variance = np.var(all_angles)
+        consistency_score = 100 / (1 + angle_variance)  # heuristic scale, higher is better
+        return consistency_score
 
     def reconstruct(self):
         total_start = time.time()
@@ -238,14 +268,23 @@ class VideoFrameSorter:
         self.write_output_video(windowed_seq)
         accuracy = self.calculate_accuracy(windowed_seq)
         neighbor_acc = self.neighbor_consistency(windowed_seq)
+        smoothness = self.calculate_smoothness(windowed_seq, sim_matrix)
+
+        reordered_frames = [self.frames[i] for i in windowed_seq]
+        temporal_ssim_score = self.temporal_ssim(reordered_frames)
+        flow_consistency_score = self.refined_optical_flow_consistency(reordered_frames)
+
         elapsed = time.time() - total_start
         print("-"*60)
         print("Reconstruction complete.")
         print(f"Execution time: {elapsed:.2f}s ({elapsed/60:.2f} min)")
         print(f"Exact position accuracy: {accuracy:.2f}%")
         print(f"Neighbor pair accuracy: {neighbor_acc:.2f}%")
+        print(f"Sequence smoothness score: {smoothness:.2f}%")
+        print(f"Temporal SSIM score: {temporal_ssim_score:.2f}%")
+        print(f"Optical Flow Consistency score: {flow_consistency_score:.2f}%")
         print("-"*60)
-        return elapsed, accuracy, neighbor_acc
+        return elapsed, accuracy, neighbor_acc, smoothness, temporal_ssim_score, flow_consistency_score
 
 
 def main():
@@ -258,26 +297,26 @@ def main():
         print(f"Input video '{input_video}' not found in {os.getcwd()}")
         return
     sorter = VideoFrameSorter(input_video, output_video)
-    exec_time, pos_acc, neigh_acc = sorter.reconstruct()
-    print(type(output_video))
-    print(output_video)
-    print(input_video)
-    print(type(input_video))
+    results = sorter.reconstruct()
+    exec_time, pos_acc, neigh_acc, smooth_acc, temporal_ssim_score, flow_consistency_score = results
     with open("execution_time.log", "w") as f:
         f.write("Video Frame Reconstruction Log\n")
         f.write("="*50+"\n")
         f.write(f"Input: {input_video}\n")
         f.write(f"Output: {output_video}\n")
-
         f.write(f"Total frames: {sorter.frame_count}\n")
         f.write(f"FPS: {sorter.fps}\n")
         f.write(f"Resolution: {sorter.frame_size}\n")
         f.write(f"Execution time: {exec_time:.2f} seconds\n")
         f.write(f"Exact position accuracy: {pos_acc:.2f}%\n")
         f.write(f"Neighbor pair accuracy: {neigh_acc:.2f}%\n")
+        f.write(f"Sequence smoothness score: {smooth_acc:.2f}%\n")
+        f.write(f"Temporal SSIM score: {temporal_ssim_score:.2f}%\n")
+        f.write(f"Optical Flow Consistency score: {flow_consistency_score:.2f}%\n")
         f.write(f"this is the input video \n{input_video}\n")
         f.write(f"this is the output video \n{output_video}\n")
     print("Execution time and accuracy logged to execution_time.log")
+
 
 if __name__ == "__main__":
     main()
