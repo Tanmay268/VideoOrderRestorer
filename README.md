@@ -92,12 +92,12 @@ pip package manager
 ## Setup Instructions
 Clone or download this repository:
 
-bash
+bash<br>
 git clone https://github.com/Tanmay268/VideoOrderRestorer.git
 
 ## Install dependencies:
 
-bash
+bash<br>
 pip install opencv-python==4.8.1.78 numpy==1.24.3 scikit-image==0.21.0 scipy==1.11.3 tqdm==4.66.1 scikit-learn torch torchvision
 
 ## Usage
@@ -105,7 +105,7 @@ Place your jumbled video file named jumbled_video.mp4 in the project root direct
 
 ## Run the reconstruction pipeline:
 
-bash
+bash<br>
 python frame_sorter.py
 The output reconstructed video will be saved as reconstructed_video.mp4.
 
