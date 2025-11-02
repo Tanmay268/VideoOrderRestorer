@@ -75,13 +75,13 @@ Temporal SSIM: Measures structural similarity between consecutive frames, reflec
 Optical Flow Consistency: Variance-based metric assessing stability of motion directions between frames.
 
 ## Time Complexity
-Step	Complexity
-Frame extraction	O(n)
-Similarity matrix	O(n²)
-Sequence initialization	O(n²)
-2-opt local search	O(k·n²) (k: max iterations)
-Total	O(n²)
-Where n = number of frames (~300).
+Step	Complexity <br>
+Frame extraction	O(n)<br>
+Similarity matrix	O(n²)<br>
+Sequence initialization	O(n²)<br>
+2-opt local search	O(k·n²) (k: max iterations)<br>
+Total	O(n²)<br>
+Where n = number of frames (~300).<br>
 
 ## Installation
 Prerequisites
