@@ -1,0 +1,11 @@
+Video Frame Reconstruction Log
+==================================================
+Input   : jumbled_video.mp4
+Output  : reconstructed_video.mp4
+Frames  : 300
+FPS     : 30
+Resolution: (1920, 1080)
+Execution Time           : 932.60 seconds
+Sequence Smoothness Score: 88.09%
+Temporal SSIM Score      : 96.12%
+Optical Flow Consistency : 21.70%
