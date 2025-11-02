@@ -137,5 +137,25 @@ Implement video frame interpolation as a post-processing step to enhance visual 
 
 Accelerate feature extractions and similarity computations using GPU acceleration.
 
+## For the tested video results obtained
+Input   : jumbled_video.mp4
+
+Output  : reconstructed_video.mp4
+
+Frames  : 300
+
+FPS     : 30
+
+Resolution: (1920, 1080)
+
+Execution Time           : 932.60 seconds
+
+Sequence Smoothness Score: 88.09%
+
+Temporal SSIM Score      : 96.12%
+
+Optical Flow Consistency : 21.70%
+
+
 ## Contact
 For questions or contributions, please contact: kaushiktanmay332@gmail.com.
